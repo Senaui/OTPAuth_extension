@@ -1,12 +1,5 @@
 import { LitElement, html, css } from "lit";
-import { alertTest, setTOTP, removeTOTP, getAllTOTP, getTOTPByLabel } from "./lib";
-
-(async () => {
-  const label = "microsoft";
-  const secret = { secret: "lcll2d6xm7t2wvxd", period: 30, url: "" };
-  await setTOTP(label, secret);
-  console.log("seeded");
-})();
+import { setTOTP, removeTOTP, getAllTOTP, getSecondsRemaining, generateTotpWithPeriod } from "./lib";
 
 class ConfirmDelete extends LitElement {
   static properties = {
@@ -62,11 +55,17 @@ class TokenItem extends LitElement {
   static properties = {
     label: { type: String },
     value: { attribute: false }, // string or {secret, period, url}
+    secondsRemaining: { type: Number },
+    period: { type: Number },
+    otp: { state: true },
   };
   constructor() {
     super();
     this.label = "";
     this.value = "";
+    this.secondsRemaining = 0;
+    this.period = 30;
+    this.otp = "";
   }
   static styles = css`
     :host { display: list-item; list-style: none; }
@@ -80,19 +79,49 @@ class TokenItem extends LitElement {
   get secretString() {
     return typeof this.value === "string" ? this.value : (this.value?.secret ?? "");
   }
+
+  get periodValue() {
+    const fromValue = typeof this.value === "object" ? Number(this.value?.period) : NaN;
+    const fromProp = Number(this.period);
+    return Number.isFinite(fromValue) && fromValue > 0 ? fromValue : (Number.isFinite(fromProp) && fromProp > 0 ? fromProp : 30);
+  }
+
+  _updateOtp() {
+    const secret = this.secretString;
+    if (!secret) {
+      this.otp = "";
+      return;
+    }
+    this.otp = generateTotpWithPeriod(secret, this.periodValue);
+  }
+
+  updated(changedProperties) {
+    if (changedProperties.has("value")) {
+      this._updateOtp();
+    }
+
+    if (changedProperties.has("secondsRemaining")) {
+      const prev = changedProperties.get("secondsRemaining");
+      const cur = this.secondsRemaining;
+      // First render (prev undefined) or rollover (e.g. 1 -> 30)
+      if (prev === undefined || (typeof prev === "number" && cur > prev)) {
+        this._updateOtp();
+      }
+    }
+  }
   _handleConfirm = () => {
     this.dispatchEvent(new CustomEvent("remove", {
       detail: { label: this.label },
       bubbles: true, composed: true
     }));
   };
+  
   render() {
-    const token = (this.secretString || "").slice(0, 4);
     return html`
       <li class="row">
         <div class="left">
           <div><strong>${this.label}</strong></div>
-          <div class="muted"><code>${token}</code></div>
+          <div class="muted"><code>${this.otp || "—"}</code></div>
         </div>
         <confirm-delete .label=${this.label} @confirm=${this._handleConfirm}></confirm-delete>
       </li>
@@ -105,6 +134,9 @@ class TotpList extends LitElement {
   static properties = {
     items: { state: true },
     filter: { state: true },
+    showForm: { state: false },
+    secondsRemaining: { state: true },
+    period: { state: true },
   };
   static styles = css`
   :host {
@@ -130,10 +162,20 @@ class TotpList extends LitElement {
     justify-content: space-between;
     margin-bottom: 8px;
   }
+  .meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 6px 0 10px;
+  }
+  .countdown {
+    font-size: 12px;
+    color: #6b7280;
+  }
   .toggle-btn {
     background: none;
     border: none;
-    font-size: 18px;
+    font-size: 25px;
     line-height: 1;
     cursor: pointer;
     color: #4f46e5;
@@ -180,15 +222,30 @@ class TotpList extends LitElement {
     this.items = {};
     this.filter = "";
     this.showForm = false; // start hidden
+    this.period = 30;
+    this.secondsRemaining = getSecondsRemaining(this.period);
+    this._countdownTimer = null;
   }
   connectedCallback() {
     super.connectedCallback();
     this.refresh();
     chrome.storage.onChanged.addListener(this._onStorageChange);
+
+    // Keep countdown in sync with the current TOTP window
+    this._tickCountdown();
+    this._countdownTimer = setInterval(() => this._tickCountdown(), 1000);
   }
   disconnectedCallback() {
     chrome.storage.onChanged.removeListener(this._onStorageChange);
+    if (this._countdownTimer) {
+      clearInterval(this._countdownTimer);
+      this._countdownTimer = null;
+    }
     super.disconnectedCallback();
+  }
+
+  _tickCountdown() {
+    this.secondsRemaining = getSecondsRemaining(this.period);
   }
   async refresh() {
     this.items = (await getAllTOTP()) || {};
@@ -219,9 +276,13 @@ class TotpList extends LitElement {
     <div class="header">
       <div class="title-bar">
         <h1>TOTP Tokens</h1>
-        <button class="toggle-btn" @click=${() => this.showForm = !this.showForm}>
-          ${this.showForm ? "-" : "+"}
+        <button class="toggle-btn" type="button" @click=${() => {this.showForm = !this.showForm}}>
+          ${this.showForm ? "-" : "Add ⌄"}
         </button>
+      </div>
+
+      <div class="meta">
+        <div class="countdown">Refresh in: <strong>${this.secondsRemaining}s</strong></div>
       </div>
 
       ${this.showForm ? html`
@@ -246,6 +307,8 @@ class TotpList extends LitElement {
               <token-item
                 .label=${label}
                 .value=${value}
+                .secondsRemaining=${this.secondsRemaining}
+                .period=${this.period}
                 @remove=${(e) => this._remove(e.detail.label)}>
               </token-item>
             `)}

@@ -1,5 +1,5 @@
 import { LitElement, html, css } from "lit";
-import { setTOTP, removeTOTP, getAllTOTP, getSecondsRemaining, generateTotpWithPeriod } from "./lib";
+import { setTOTP, removeTOTP, getAllTOTP, getSecondsRemaining, generateTotpWithPeriod, getItem, setItem } from "./lib";
 
 class ConfirmDelete extends LitElement {
   static properties = {
@@ -92,7 +92,8 @@ class TokenItem extends LitElement {
       this.otp = "";
       return;
     }
-    this.otp = generateTotpWithPeriod(secret, this.periodValue);
+    try { this.otp = generateTotpWithPeriod(secret, this.periodValue); }
+    catch { this.otp = 'Invalid secret'; }
   }
 
   updated(changedProperties) {
@@ -101,12 +102,8 @@ class TokenItem extends LitElement {
     }
 
     if (changedProperties.has("secondsRemaining")) {
-      const prev = changedProperties.get("secondsRemaining");
-      const cur = this.secondsRemaining;
-      // First render (prev undefined) or rollover (e.g. 1 -> 30)
-      if (prev === undefined || (typeof prev === "number" && cur > prev)) {
-        this._updateOtp();
-      }
+      // Recompute from wall time, including after a suspended popup or custom-period rollover.
+      this._updateOtp();
     }
   }
   _handleConfirm = () => {
@@ -121,7 +118,7 @@ class TokenItem extends LitElement {
       <li class="row">
         <div class="left">
           <div><strong>${this.label}</strong></div>
-          <div class="muted"><code>${this.otp || "—"}</code></div>
+          <div class="muted"><code>${this.otp || "—"}</code> · ${getSecondsRemaining(this.periodValue)}s</div>
         </div>
         <confirm-delete .label=${this.label} @confirm=${this._handleConfirm}></confirm-delete>
       </li>
@@ -137,6 +134,8 @@ class TotpList extends LitElement {
     showForm: { state: false },
     secondsRemaining: { state: true },
     period: { state: true },
+    account: { state: true },
+    status: { state: true },
   };
   static styles = css`
   :host {
@@ -220,6 +219,8 @@ class TotpList extends LitElement {
   constructor() {
     super();
     this.items = {};
+    this.account = {};
+    this.status = "";
     this.filter = "";
     this.showForm = false; // start hidden
     this.period = 30;
@@ -229,6 +230,7 @@ class TotpList extends LitElement {
   connectedCallback() {
     super.connectedCallback();
     this.refresh();
+    getItem('microsoftAccount').then(value => { this.account = value || {}; });
     chrome.storage.onChanged.addListener(this._onStorageChange);
 
     // Keep countdown in sync with the current TOTP window
@@ -260,8 +262,29 @@ class TotpList extends LitElement {
     const secretInput = form.secret.value.trim();
     if (!label || !secretInput) return;
     // store as object so we can add metadata later
-    await setTOTP(label, { secret: secretInput, period: 30, url: "" });
-    form.reset();
+    try {
+      if (Object.hasOwn(this.items, label)) throw new Error('That label already exists. Delete it first to replace it.');
+      await setTOTP(label, { secret: secretInput, period: 30, url: "" });
+      form.reset();
+      this.status = 'Token saved.';
+    } catch (error) { this.status = error.message; }
+  }
+  async _saveAccount(e) {
+    e.preventDefault();
+    const f = e.currentTarget.elements;
+    const account = {
+      username: f.username.value.trim(), password: f.password.value,
+      tokenLabel: f.tokenLabel.value, enabled: f.enabled.checked, autoSubmit: f.autoSubmit.checked,
+    };
+    try {
+      await setItem('microsoftAccount', account);
+      this.account = account;
+      this.status = 'Microsoft settings saved. Reload the sign-in page to apply them.';
+    } catch { this.status = 'Could not save settings.'; }
+  }
+  async _clearAccount() {
+    try { await setItem('microsoftAccount', null); this.account = {}; this.status = 'Microsoft account removed.'; }
+    catch { this.status = 'Could not remove account.'; }
   }
   async _remove(label) {
     await removeTOTP(label);
@@ -288,13 +311,32 @@ class TotpList extends LitElement {
       ${this.showForm ? html`
         <form @submit=${this._handleAdd}>
           <div class="row">
-            <input name="label" placeholder="Label (e.g., example.com)" />
-            <input name="secret" placeholder="Secret (base32)" />
+            <input name="label" required placeholder="Label (e.g., example.com)" />
+            <input name="secret" type="password" required placeholder="Secret (base32)" />
           </div>
           <button class="primary" type="submit">Add</button>
         </form>
       ` : ""}
 
+      <p role="status">${this.status}</p>
+      <details>
+        <summary>Microsoft sign-in settings</summary>
+        <p>Saved locally in this browser, without encryption. Use only on a trusted device.</p>
+        <form @submit=${this._saveAccount}>
+          <label>Email <input name="username" type="email" required .value=${this.account.username || ''}></label>
+          <label>Password (optional) <input name="password" type="password" autocomplete="new-password" .value=${this.account.password || ''}></label>
+          <label>Authenticator token
+            <select name="tokenLabel">
+              <option value="">Do not fill codes</option>
+              ${Object.keys(this.items).map(label => html`<option value=${label} ?selected=${label === this.account.tokenLabel}>${label}</option>`)}
+            </select>
+          </label>
+          <label><input name="enabled" type="checkbox" ?checked=${this.account.enabled}> Enable autofill</label>
+          <label><input name="autoSubmit" type="checkbox" ?checked=${this.account.autoSubmit}> Automatically submit filled steps</label>
+          <button type="submit" class="primary">Save settings</button>
+          <button type="button" @click=${this._clearAccount}>Remove saved account</button>
+        </form>
+      </details>
       <input placeholder="Filter…" @input=${e => (this.filter = e.target.value)} />
     </div>
 
@@ -321,13 +363,3 @@ class TotpList extends LitElement {
 
 }
 customElements.define("totp-list", TotpList);
-
-
-
-
-
-// must remove before launching
-
-
-
-

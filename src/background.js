@@ -1,53 +1,30 @@
-import normalizeUrl from "normalize-url";
-import {scheduleTOTPUpdate, generateTotp, getTOTPByLabel} from "./lib.js";
+import { generateTotpWithPeriod, getItem, getTOTPByLabel, getSecondsRemaining } from './lib.js';
+import { isMicrosoftLogin, validAccount } from './login.js';
 
-console.log('Background service worker loaded');
+const storageReady = chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
 
-// background.js
-const urlRecords = [
-    "https://example.com",
-    "https://accounts.google.com",
-    "https://login.microsoftonline.com//login"
-];
-
-const lastProcessedUrls = {};
-
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-    if (changeInfo.status === "complete" && tab.url) {
-        const normalized = normalizeUrl(tab.url);
-        if (lastProcessedUrls[tabId] === normalized) {
-            return;
-        }
-        lastProcessedUrls[tabId] = normalized; // Mark as processed
-
-        console.log('listener worked');
-        console.log('Tab updated:', normalized);
-        const match = urlRecords.find(recordUrl => normalized.startsWith(recordUrl));
-        if (match) {
-            console.log('Tab URL matches a recorded URL:', tab.url);
-            chrome.tabs.sendMessage(tabId, {
-                type: "SHOW_ALERT",
-                payload: { url: normalized }
-            });
-        }
+// Generate on demand because Manifest V3 workers can be suspended.
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (message.type !== 'GET_LOGIN_STEP') return;
+  if (sender.id !== chrome.runtime.id || sender.frameId !== 0 || !isMicrosoftLogin(sender.url)) {
+    respond({ error: 'Unsupported page' }); return;
+  }
+  (async () => {
+    await storageReady;
+    const account = await getItem('microsoftAccount');
+    if (!validAccount(account) || !account.enabled) return { enabled: false };
+    if (message.step !== 'username' && message.username?.toLowerCase() !== account.username.toLowerCase()) {
+      return { enabled: false };
     }
+    let value;
+    if (message.step === 'username') value = account.username;
+    else if (message.step === 'password') value = account.password;
+    else if (message.step === 'totp') {
+      const token = await getTOTPByLabel(account.tokenLabel);
+      if (token && getSecondsRemaining(token.period || 30) < 5) return { retry: true };
+      if (token) value = generateTotpWithPeriod(typeof token === 'string' ? token : token.secret, token.period || 30);
+    }
+    return { enabled: true, value, autoSubmit: account.autoSubmit === true };
+  })().then(respond, () => respond({ error: 'Unable to load sign-in settings' }));
+  return true;
 });
-
-(async () => {
-    console.log('Setting secret in background script');
-    
-    // Schedule TOTP updates every 30 seconds
-    scheduleTOTPUpdate(30, async () => {
-        const secret = await getTOTPByLabel('example.com');
-        if (secret) {
-            const totp = generateTotp(secret['secret']);
-            console.log('Generated TOTP:', totp);
-
-            // Here you can send the TOTP to the content script or handle it as needed
-        } else {
-            console.log('No secret found for TOTP generation');
-        }
-    });
-})();
-
-
